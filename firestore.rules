@@ -1,0 +1,177 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper: Check if the user is checking/modifying their own record
+    // Helper: Check if the user is checking/modifying their own record
+    function isOwner(userId) {
+      return isAccessAllowed() && isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Helper: Check if a matched UID is an ancestor of the requestor
+    function isAncestor(ancestorUid) {
+      return isAccessAllowed() && isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             ancestorUid in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.referralPath;
+    }
+
+    // Helper: Check if the user is a super admin
+    function isSuperAdmin() {
+      return isAuthenticated() && request.auth.token.email == "udaykiranvempati123@gmail.com";
+    }
+
+    // Helper: Check if maintenance mode is active
+    function isMaintenanceActive() {
+      return exists(/databases/$(database)/documents/settings/maintenance) &&
+             get(/databases/$(database)/documents/settings/maintenance).data.active == true;
+    }
+
+    // Helper: Check if access is allowed under maintenance constraints
+    function isAccessAllowed() {
+      return isSuperAdmin() || !isMaintenanceActive();
+    }
+
+    // Helper: Check if the user is an admin
+    function isAdmin() {
+      return isAccessAllowed() && isAuthenticated() && (
+        request.auth.token.email == "udaykiranvempati123@gmail.com" ||
+        request.auth.token.email == "primeappconnect@gmail.com" ||
+        request.auth.token.email == "udaykiranvempati@gmail.com" ||
+        (request.auth.token.email != null && request.auth.token.email.matches('.*admin.*')) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin")
+      );
+    }
+
+    // USERS COLLECTION RULES
+    match /users/{userId} {
+      // Allow read if owner, admin, or if the requestor is an ancestor (request.auth.uid is in the document's referralPath),
+      // or if looking up a sponsor's public profile (via referralCode check).
+      allow read: if isAccessAllowed() && (
+                    isOwner(userId) || 
+                    isAdmin() || 
+                    (isAuthenticated() && resource != null && resource.data.referralPath != null && request.auth.uid in resource.data.referralPath) ||
+                    (resource != null && resource.data.referralCode != null)
+                  );
+      allow create: if isAccessAllowed() && isAuthenticated() && request.auth.uid == userId;
+      // Allow update if owner, admin, or if the user is an ancestor performing metrics increments
+      allow update: if isAccessAllowed() && (
+                    isOwner(userId) || 
+                    isAdmin() || 
+                    (isAncestor(userId) && 
+                     request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                       'directReferralsCount', 
+                       'totalTeamMembersCount', 
+                       'campaignCount', 
+                       'approvedCount', 
+                       'teamEarnings',
+                       'totalEarnings',
+                       'earnings',
+                       'updatedAt'
+                     ]))
+                  );
+      allow delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // CAMPAIGNS CONFIGURATION RULES
+    match /campaigns/{campaignId} {
+      // Anyone can view campaign requirements and details
+      allow read: if isAccessAllowed();
+      allow write: if isAccessAllowed() && isAdmin();
+    }
+
+    // REFERRALS SYSTEM RULES
+    match /referrals/{referralId} {
+      // Promoters can read referrals they generated or refer to,
+      // or if looked up via the public/guest landing page (resource.data.referrerUid lookup).
+      allow read: if isAccessAllowed() && (
+                    isAdmin() || 
+                    (isAuthenticated() && resource != null && (resource.data.referrerUid == request.auth.uid || resource.data.refereeUid == request.auth.uid)) ||
+                    (resource != null && resource.data.referrerUid != null)
+                  );
+      // Anyone (guest/user) can write a referral linkage log
+      allow create: if isAccessAllowed();
+      // Only administrators can edit/approve referral status payouts,
+      // except when referee is marking inviteClicked or joinedGroup.
+      allow update: if isAccessAllowed() && (
+        isAdmin() || (
+          isAuthenticated() && 
+          resource != null &&
+          resource.data.refereeUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['inviteClicked', 'joinedGroup'])
+        )
+      );
+      allow delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // NOTIFICATIONS SYSTEM RULES
+    match /notifications/{notificationId} {
+      allow read: if isAccessAllowed() && (isAdmin() || (isAuthenticated() && resource != null && resource.data.uid == request.auth.uid));
+      allow create: if isAccessAllowed(); // Allows generating alert messages from user actions
+      allow update: if isAccessAllowed() && (isAdmin() || (isAuthenticated() && resource != null && resource.data.uid == request.auth.uid));
+      allow delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // WITHDRAWALS TRANSFERS RULES
+    match /withdrawals/{withdrawalId} {
+      allow read: if isAccessAllowed() && (isAdmin() || (isAuthenticated() && resource != null && resource.data.uid == request.auth.uid));
+      allow create: if isAccessAllowed() && isAuthenticated() && request.resource.data.uid == request.auth.uid;
+      allow update: if isAccessAllowed() && isAdmin();
+      allow delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // CLICK TRACKING SYSTEM RULES
+    match /campaignClicks/{clickId} {
+      // Anyone can log clicks via outbound redirection link tracking
+      allow create: if isAccessAllowed();
+      allow read: if isAccessAllowed() && (isAdmin() || (isAuthenticated() && resource != null && resource.data.userId == request.auth.uid));
+      allow update, delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // CALLBACK COMPLETIONS GATEWAY RULES
+    match /campaign_completions/{completionId} {
+      // Open create permission for advertiser postbacks/callbacks
+      allow create: if isAccessAllowed();
+      allow read, update, delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // AUDIT OPERATIONS LOGS RULES
+    match /activities/{activityId} {
+      allow read: if isAccessAllowed() && (isAdmin() || (isAuthenticated() && resource != null && resource.data.userId == request.auth.uid));
+      allow create: if isAccessAllowed() && isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // SUPPORT TICKETS RULES
+    match /supportTickets/{ticketId} {
+      allow read: if isAccessAllowed() && (isAdmin() || (isAuthenticated() && resource != null && resource.data.userId == request.auth.uid));
+      allow create: if isAccessAllowed() && isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // TEAM HIERARCHY TREE RULES
+    match /teamHierarchy/{userId} {
+      allow read: if isAccessAllowed() && isAuthenticated(); // Allows checking multi-depth tree connections
+      allow create: if isAccessAllowed() && isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAccessAllowed() && isAdmin();
+    }
+
+    // RANK LEVELS & PLATFORM SETTINGS RULES
+    match /settings/{settingId} {
+      allow read: if true; // Allows reading level settings/targets (needed for checking maintenance state)
+      allow write: if (settingId == "maintenance") ? isSuperAdmin() : 
+                    (settingId == "counters") ? isAccessAllowed() :
+                    (isAccessAllowed() && isAdmin());
+    }
+
+    // TEAM ANALYTICS RULES
+    match /teamAnalytics/{docId} {
+      allow read, write: if isAccessAllowed() && isAdmin();
+    }
+  }
+}
